@@ -1,5 +1,4 @@
 import { type NextRequest, NextResponse } from "next/server";
-import tesseract from "node-tesseract-ocr";
 import pdfParse from "pdf-parse";
 import { connectToDatabase } from "@/lib/mongodb";
 import Case from "@/models/Case";
@@ -10,6 +9,24 @@ import { writeFile, mkdir } from "fs/promises";
 import { existsSync } from "fs";
 import { analyzeDocuments, analyzeDocumentsSimple, generateDescription } from "@/lib/ai";
 import { verifyToken } from "@/lib/jwt";
+import { exec } from "child_process";
+import { promisify } from "util";
+
+const execPromise = promisify(exec);
+
+async function performOCR(filePaths: string[]): Promise<string[]> {
+  try {
+    const command = `python scripts\\ocr_script.py ${filePaths.map(p => `"${p}"`).join(" ")}`;
+    console.log(`Executing OCR command: ${command}`);
+    const { stdout } = await execPromise(command, { encoding: 'utf8' });
+    console.log(`EasyOCR raw output: ${stdout}`);
+    const results = JSON.parse(stdout);
+    return results.map((result: any) => (result.success ? result.text : ""));
+  } catch (error) {
+    console.warn(`EasyOCR failed for ${filePaths.join(", ")}:`, error);
+    return filePaths.map(() => "");
+  }
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -59,8 +76,12 @@ export async function POST(req: NextRequest) {
 
     const extractedData: string[] = [];
     const documents: any[] = [];
+    const imagePaths: string[] = [];
+    const imageIndices: number[] = [];
 
-    for (const file of files) {
+    // Collect image files for batch OCR
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
       const fileName = file.name;
       const fileType = file.type.toLowerCase();
       const bytes = await file.arrayBuffer();
@@ -97,19 +118,10 @@ export async function POST(req: NextRequest) {
           fileType === "image/jpg" ||
           fileType === "image/png"
         ) {
-          console.log(`Processing image: ${fileName}`);
-          try {
-            content = await tesseract.recognize(filePath, {
-              lang: "rus+eng",
-              oem: 3,
-              psm: 6,
-            });
-            console.log(`Extracted image text length: ${content.length}`);
-          } catch (ocrError) {
-            console.warn(`OCR failed for ${fileName}:`, ocrError);
-            content = "";
-            console.log(`Falling back to empty content for ${fileName}`);
-          }
+          console.log(`Queuing image for OCR: ${fileName}`);
+          imagePaths.push(filePath);
+          imageIndices.push(i);
+          content = ""; // Placeholder until batch OCR
         } else {
           console.error(`Unsupported file type: ${fileType}`);
           return NextResponse.json(
@@ -154,6 +166,20 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    // Batch process images with EasyOCR
+    if (imagePaths.length > 0) {
+      console.log(`Processing ${imagePaths.length} images with EasyOCR`);
+      const ocrResults = await performOCR(imagePaths);
+      for (let i = 0; i < imageIndices.length; i++) {
+        const index = imageIndices[i];
+        const content = ocrResults[i];
+        extractedData[index] = content;
+        documents[index].content = content;
+        await documents[index].save();
+        console.log(`Extracted image text length for ${files[index].name}: ${content.length}`);
+      }
+    }
+
     let analysis;
     const combinedContent = extractedData.join("\n");
     try {
@@ -173,7 +199,7 @@ export async function POST(req: NextRequest) {
       analysis = {
         title: "Новое дело",
         deadline: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split("T")[0],
-        organizer: { name: "", contacts: {} },
+        organizer: { name: "", director: "", contacts: { phone: "", email: "" } },
         details: {
           location: "",
           participants: 0,
@@ -256,7 +282,7 @@ export async function POST(req: NextRequest) {
       recommendations: analysis.recommendations || [],
     };
 
-    caseDoc.organizer = analysis.organizer || { name: "", contacts: {} };
+    caseDoc.organizer = analysis.organizer || { name: "", director: "", contacts: { phone: "", email: "" } };
     caseDoc.details = processedDetails;
     caseDoc.updatedAt = new Date();
 
